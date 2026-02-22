@@ -1,0 +1,255 @@
+# =============================================================================
+# Reusable Notification Workflow
+# =============================================================================
+# Sends notifications to Slack, Microsoft Teams, and/or Discord based on the
+# channels input. Typically called at the end of a pipeline to report results.
+#
+# USAGE:
+#   jobs:
+#     notify:
+#       if: always()
+#       needs: [build, deploy]
+#       uses: <owner>/<repo>/.github/workflows/notify.yml@main
+#       with:
+#         status: ${{ needs.deploy.result }}
+#         environment: 'production'
+#         message: 'Deployment of v1.2.3 completed'
+#         channels: 'slack,teams'
+#       secrets:
+#         slack-webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+#         teams-webhook: ${{ secrets.TEAMS_WEBHOOK_URL }}
+# =============================================================================
+
+name: Reusable Notify
+
+on:
+  workflow_call:
+    inputs:
+      status:
+        description: 'Pipeline status to report (e.g. success, failure, cancelled)'
+        type: string
+        required: true
+      environment:
+        description: 'Environment name for context (e.g. staging, production)'
+        type: string
+        required: false
+        default: ''
+      message:
+        description: 'Custom message body to include in the notification'
+        type: string
+        required: false
+        default: ''
+      channels:
+        description: 'Comma-separated notification channels: slack, teams, discord'
+        type: string
+        required: false
+        default: 'slack'
+    secrets:
+      slack-webhook:
+        description: 'Slack Incoming Webhook URL'
+        required: false
+      teams-webhook:
+        description: 'Microsoft Teams Incoming Webhook URL'
+        required: false
+      discord-webhook:
+        description: 'Discord Webhook URL'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Prepare notification payload
+        id: payload
+        run: |
+          # Determine emoji and colour based on status
+          case "${{ inputs.status }}" in
+            success)
+              EMOJI="white_check_mark"
+              COLOR="good"
+              COLOR_HEX="#2ea44f"
+              TEAMS_COLOR="00FF00"
+              STATUS_TEXT="Success"
+              ;;
+            failure)
+              EMOJI="x"
+              COLOR="danger"
+              COLOR_HEX="#d73a49"
+              TEAMS_COLOR="FF0000"
+              STATUS_TEXT="Failed"
+              ;;
+            cancelled)
+              EMOJI="warning"
+              COLOR="warning"
+              COLOR_HEX="#dbab09"
+              TEAMS_COLOR="FFFF00"
+              STATUS_TEXT="Cancelled"
+              ;;
+            *)
+              EMOJI="information_source"
+              COLOR="#1f78d1"
+              COLOR_HEX="#1f78d1"
+              TEAMS_COLOR="0078D7"
+              STATUS_TEXT="${{ inputs.status }}"
+              ;;
+          esac
+
+          ENV_TEXT=""
+          if [ -n "${{ inputs.environment }}" ]; then
+            ENV_TEXT=" (${{ inputs.environment }})"
+          fi
+
+          TITLE="${STATUS_TEXT}: ${{ github.repository }}${ENV_TEXT}"
+          BODY="${{ inputs.message }}"
+          if [ -z "${BODY}" ]; then
+            BODY="Workflow \`${{ github.workflow }}\` on \`${{ github.ref_name }}\` finished with status: **${STATUS_TEXT}**"
+          fi
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          echo "emoji=${EMOJI}" >> "$GITHUB_OUTPUT"
+          echo "color=${COLOR}" >> "$GITHUB_OUTPUT"
+          echo "color-hex=${COLOR_HEX}" >> "$GITHUB_OUTPUT"
+          echo "teams-color=${TEAMS_COLOR}" >> "$GITHUB_OUTPUT"
+          echo "status-text=${STATUS_TEXT}" >> "$GITHUB_OUTPUT"
+          echo "title=${TITLE}" >> "$GITHUB_OUTPUT"
+          echo "body=${BODY}" >> "$GITHUB_OUTPUT"
+          echo "run-url=${RUN_URL}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Slack
+      # -----------------------------------------------------------------------
+      - name: Send Slack notification
+        if: contains(inputs.channels, 'slack') && secrets.slack-webhook != ''
+        run: |
+          curl -sSf -X POST "${{ secrets.slack-webhook }}" \
+            -H 'Content-Type: application/json' \
+            -d @- <<'SLACK_EOF'
+          {
+            "attachments": [
+              {
+                "color": "${{ steps.payload.outputs.color-hex }}",
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": ":${{ steps.payload.outputs.emoji }}: ${{ steps.payload.outputs.title }}",
+                      "emoji": true
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      { "type": "mrkdwn", "text": "*Repository:*\n${{ github.repository }}" },
+                      { "type": "mrkdwn", "text": "*Branch:*\n${{ github.ref_name }}" },
+                      { "type": "mrkdwn", "text": "*Status:*\n${{ steps.payload.outputs.status-text }}" },
+                      { "type": "mrkdwn", "text": "*Actor:*\n${{ github.actor }}" }
+                    ]
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "${{ steps.payload.outputs.body }}"
+                    }
+                  },
+                  {
+                    "type": "actions",
+                    "elements": [
+                      {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "View Run" },
+                        "url": "${{ steps.payload.outputs.run-url }}"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+          SLACK_EOF
+
+      # -----------------------------------------------------------------------
+      # Microsoft Teams
+      # -----------------------------------------------------------------------
+      - name: Send Teams notification
+        if: contains(inputs.channels, 'teams') && secrets.teams-webhook != ''
+        run: |
+          curl -sSf -X POST "${{ secrets.teams-webhook }}" \
+            -H 'Content-Type: application/json' \
+            -d @- <<'TEAMS_EOF'
+          {
+            "@type": "MessageCard",
+            "@context": "https://schema.org/extensions",
+            "themeColor": "${{ steps.payload.outputs.teams-color }}",
+            "summary": "${{ steps.payload.outputs.title }}",
+            "sections": [
+              {
+                "activityTitle": "${{ steps.payload.outputs.title }}",
+                "facts": [
+                  { "name": "Repository", "value": "${{ github.repository }}" },
+                  { "name": "Branch", "value": "${{ github.ref_name }}" },
+                  { "name": "Status", "value": "${{ steps.payload.outputs.status-text }}" },
+                  { "name": "Actor", "value": "${{ github.actor }}" }
+                ],
+                "text": "${{ steps.payload.outputs.body }}"
+              }
+            ],
+            "potentialAction": [
+              {
+                "@type": "OpenUri",
+                "name": "View Run",
+                "targets": [{ "os": "default", "uri": "${{ steps.payload.outputs.run-url }}" }]
+              }
+            ]
+          }
+          TEAMS_EOF
+
+      # -----------------------------------------------------------------------
+      # Discord
+      # -----------------------------------------------------------------------
+      - name: Send Discord notification
+        if: contains(inputs.channels, 'discord') && secrets.discord-webhook != ''
+        run: |
+          # Discord colour is decimal integer
+          case "${{ steps.payload.outputs.color-hex }}" in
+            "#2ea44f") DISCORD_COLOR=3057231 ;;
+            "#d73a49") DISCORD_COLOR=14110537 ;;
+            "#dbab09") DISCORD_COLOR=14396169 ;;
+            *)         DISCORD_COLOR=2062161 ;;
+          esac
+
+          curl -sSf -X POST "${{ secrets.discord-webhook }}" \
+            -H 'Content-Type: application/json' \
+            -d @- <<DISCORD_EOF
+          {
+            "embeds": [
+              {
+                "title": "${{ steps.payload.outputs.title }}",
+                "description": "${{ steps.payload.outputs.body }}",
+                "color": ${DISCORD_COLOR},
+                "fields": [
+                  { "name": "Repository", "value": "${{ github.repository }}", "inline": true },
+                  { "name": "Branch", "value": "${{ github.ref_name }}", "inline": true },
+                  { "name": "Actor", "value": "${{ github.actor }}", "inline": true }
+                ],
+                "url": "${{ steps.payload.outputs.run-url }}"
+              }
+            ]
+          }
+          DISCORD_EOF
+
+      - name: Notification summary
+        run: |
+          echo "### Notifications Sent" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Channel | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Slack | ${{ contains(inputs.channels, 'slack') && 'sent' || 'skipped' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Teams | ${{ contains(inputs.channels, 'teams') && 'sent' || 'skipped' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Discord | ${{ contains(inputs.channels, 'discord') && 'sent' || 'skipped' }} |" >> "$GITHUB_STEP_SUMMARY"

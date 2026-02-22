@@ -1,0 +1,205 @@
+# =============================================================================
+# Reusable Terraform Workflow
+# =============================================================================
+# Runs Terraform operations: init, validate, plan, and conditionally apply or
+# destroy. Outputs plan/apply results for downstream consumption.
+#
+# USAGE:
+#   jobs:
+#     terraform-plan:
+#       uses: <owner>/<repo>/.github/workflows/terraform.yml@main
+#       with:
+#         working-directory: './infra/environments/staging'
+#         terraform-version: '1.6'
+#         command: 'plan'
+#         environment: 'staging'
+#       secrets:
+#         cloud-credentials: ${{ secrets.AWS_CREDENTIALS }}
+#
+#     terraform-apply:
+#       needs: [terraform-plan]
+#       uses: <owner>/<repo>/.github/workflows/terraform.yml@main
+#       with:
+#         working-directory: './infra/environments/staging'
+#         terraform-version: '1.6'
+#         command: 'apply'
+#         environment: 'staging'
+#         auto-approve: true
+#       secrets:
+#         cloud-credentials: ${{ secrets.AWS_CREDENTIALS }}
+# =============================================================================
+
+name: Reusable Terraform
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: 'Directory containing Terraform configuration files'
+        type: string
+        required: false
+        default: '.'
+      terraform-version:
+        description: 'Terraform CLI version to install'
+        type: string
+        required: false
+        default: '1.6'
+      command:
+        description: 'Terraform command to execute: plan, apply, or destroy'
+        type: string
+        required: true
+        # Callers should pass one of: plan | apply | destroy
+      environment:
+        description: 'Target environment name (used for state isolation and labelling)'
+        type: string
+        required: true
+      auto-approve:
+        description: 'Skip interactive approval for apply/destroy (use with caution)'
+        type: boolean
+        required: false
+        default: false
+    outputs:
+      plan-output:
+        description: 'Terraform plan output (text summary of changes)'
+        value: ${{ jobs.terraform.outputs.plan-output }}
+      apply-output:
+        description: 'Terraform apply/destroy output'
+        value: ${{ jobs.terraform.outputs.apply-output }}
+    secrets:
+      cloud-credentials:
+        description: 'Cloud provider credentials (e.g. AWS access keys JSON, GCP service account key)'
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write  # For posting plan output as PR comment
+
+jobs:
+  terraform:
+    name: "Terraform ${{ inputs.command }} (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      TF_IN_AUTOMATION: 'true'
+      TF_INPUT: 'false'
+    outputs:
+      plan-output: ${{ steps.plan.outputs.stdout || '' }}
+      apply-output: ${{ steps.apply.outputs.stdout || '' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform ${{ inputs.terraform-version }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: true  # Enables stdout/stderr capture in outputs
+
+      - name: Configure cloud credentials
+        run: |
+          echo '${{ secrets.cloud-credentials }}' > /tmp/cloud-credentials.json
+          chmod 600 /tmp/cloud-credentials.json
+
+          # --- AWS ---
+          # If credentials are AWS-style JSON, export them as environment variables
+          if echo '${{ secrets.cloud-credentials }}' | jq -e '.aws_access_key_id' > /dev/null 2>&1; then
+            echo "AWS_ACCESS_KEY_ID=$(echo '${{ secrets.cloud-credentials }}' | jq -r '.aws_access_key_id')" >> "$GITHUB_ENV"
+            echo "AWS_SECRET_ACCESS_KEY=$(echo '${{ secrets.cloud-credentials }}' | jq -r '.aws_secret_access_key')" >> "$GITHUB_ENV"
+            REGION=$(echo '${{ secrets.cloud-credentials }}' | jq -r '.region // "us-east-1"')
+            echo "AWS_DEFAULT_REGION=${REGION}" >> "$GITHUB_ENV"
+          fi
+
+          # --- GCP ---
+          if echo '${{ secrets.cloud-credentials }}' | jq -e '.type == "service_account"' > /dev/null 2>&1; then
+            echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/cloud-credentials.json" >> "$GITHUB_ENV"
+          fi
+
+          # --- Azure ---
+          if echo '${{ secrets.cloud-credentials }}' | jq -e '.clientId' > /dev/null 2>&1; then
+            echo "ARM_CLIENT_ID=$(echo '${{ secrets.cloud-credentials }}' | jq -r '.clientId')" >> "$GITHUB_ENV"
+            echo "ARM_CLIENT_SECRET=$(echo '${{ secrets.cloud-credentials }}' | jq -r '.clientSecret')" >> "$GITHUB_ENV"
+            echo "ARM_TENANT_ID=$(echo '${{ secrets.cloud-credentials }}' | jq -r '.tenantId')" >> "$GITHUB_ENV"
+            echo "ARM_SUBSCRIPTION_ID=$(echo '${{ secrets.cloud-credentials }}' | jq -r '.subscriptionId')" >> "$GITHUB_ENV"
+          fi
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -no-color
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        if: inputs.command == 'plan' || inputs.command == 'apply'
+        id: plan
+        run: |
+          terraform plan -no-color -out=tfplan \
+            -detailed-exitcode \
+            2>&1 | tee /tmp/plan-output.txt || true
+        continue-on-error: true
+
+      - name: Post plan to PR comment
+        if: (inputs.command == 'plan' || inputs.command == 'apply') && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('/tmp/plan-output.txt', 'utf8');
+            const truncated = plan.length > 60000
+              ? plan.substring(0, 60000) + '\n\n... (truncated)'
+              : plan;
+
+            const body = `### Terraform Plan — \`${{ inputs.environment }}\`
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+            *Command: \`${{ inputs.command }}\` | Directory: \`${{ inputs.working-directory }}\`*`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Terraform Apply
+        if: inputs.command == 'apply' && inputs.auto-approve
+        id: apply
+        run: terraform apply -no-color -auto-approve tfplan
+
+      - name: Terraform Apply (manual approval gate)
+        if: inputs.command == 'apply' && !inputs.auto-approve
+        run: |
+          echo "::error::auto-approve is false. Use environment protection rules or set auto-approve: true."
+          exit 1
+
+      - name: Terraform Destroy
+        if: inputs.command == 'destroy' && inputs.auto-approve
+        id: destroy
+        run: terraform destroy -no-color -auto-approve
+
+      - name: Terraform Destroy (manual approval gate)
+        if: inputs.command == 'destroy' && !inputs.auto-approve
+        run: |
+          echo "::error::auto-approve is false for destroy. This is a safeguard. Set auto-approve: true to proceed."
+          exit 1
+
+      - name: Write step summary
+        if: always()
+        run: |
+          echo "### Terraform ${{ inputs.command }} — ${{ inputs.environment }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Step | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Init | \`${{ steps.init.outcome }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Validate | \`${{ steps.validate.outcome }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Plan | \`${{ steps.plan.outcome || 'skipped' }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Apply | \`${{ steps.apply.outcome || 'skipped' }}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up credentials
+        if: always()
+        run: rm -f /tmp/cloud-credentials.json

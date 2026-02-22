@@ -1,0 +1,254 @@
+# =============================================================================
+# Reusable Security Scanning Workflow
+# =============================================================================
+# Runs multiple security scans: dependency audit, CodeQL analysis, container
+# image scanning, and uploads SARIF results to GitHub Security tab.
+#
+# USAGE:
+#   jobs:
+#     security:
+#       uses: <owner>/<repo>/.github/workflows/security-scan.yml@main
+#       with:
+#         scan-type: 'full'
+#         fail-on-severity: 'high'
+#       permissions:
+#         security-events: write
+#         contents: read
+# =============================================================================
+
+name: Reusable Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      scan-type:
+        description: 'Scan depth: "full" runs all scanners, "quick" runs dependency audit only'
+        type: string
+        required: false
+        default: 'full'
+        # Callers should pass one of: full | quick
+      fail-on-severity:
+        description: 'Minimum severity that causes the workflow to fail: critical, high, medium, or low'
+        type: string
+        required: false
+        default: 'high'
+        # Callers should pass one of: critical | high | medium | low
+    outputs:
+      vulnerabilities-found:
+        description: 'Total number of vulnerabilities found across all scans'
+        value: ${{ jobs.scan.outputs.vulnerabilities-found }}
+      report-url:
+        description: 'URL to the full security report (GitHub Security tab)'
+        value: ${{ jobs.scan.outputs.report-url }}
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  scan:
+    name: "Security Scan (${{ inputs.scan-type }})"
+    runs-on: ubuntu-latest
+    outputs:
+      vulnerabilities-found: ${{ steps.summary.outputs.total-vulnerabilities }}
+      report-url: ${{ steps.summary.outputs.report-url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # 1. Dependency Audit (always runs)
+      # -----------------------------------------------------------------------
+      - name: Setup Node.js (for npm audit)
+        if: hashFiles('package-lock.json') != '' || hashFiles('yarn.lock') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run npm audit
+        id: npm-audit
+        if: hashFiles('package-lock.json') != ''
+        run: |
+          set +e
+          npm audit --json > /tmp/npm-audit.json 2>&1
+          AUDIT_EXIT=$?
+          set -e
+
+          # Count vulnerabilities by severity
+          CRITICAL=$(jq '[.vulnerabilities[] | select(.severity == "critical")] | length' /tmp/npm-audit.json 2>/dev/null || echo "0")
+          HIGH=$(jq '[.vulnerabilities[] | select(.severity == "high")] | length' /tmp/npm-audit.json 2>/dev/null || echo "0")
+          MEDIUM=$(jq '[.vulnerabilities[] | select(.severity == "moderate")] | length' /tmp/npm-audit.json 2>/dev/null || echo "0")
+          LOW=$(jq '[.vulnerabilities[] | select(.severity == "low")] | length' /tmp/npm-audit.json 2>/dev/null || echo "0")
+
+          echo "critical=${CRITICAL}" >> "$GITHUB_OUTPUT"
+          echo "high=${HIGH}" >> "$GITHUB_OUTPUT"
+          echo "medium=${MEDIUM}" >> "$GITHUB_OUTPUT"
+          echo "low=${LOW}" >> "$GITHUB_OUTPUT"
+          echo "total=$((CRITICAL + HIGH + MEDIUM + LOW))" >> "$GITHUB_OUTPUT"
+
+          echo "### npm audit results" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Severity | Count |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Critical | ${CRITICAL} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| High | ${HIGH} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Medium | ${MEDIUM} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Low | ${LOW} |" >> "$GITHUB_STEP_SUMMARY"
+        continue-on-error: true
+
+      - name: Run pip audit (Python)
+        id: pip-audit
+        if: hashFiles('requirements.txt') != '' || hashFiles('Pipfile.lock') != '' || hashFiles('poetry.lock') != ''
+        run: |
+          pip install pip-audit 2>/dev/null
+          set +e
+          pip-audit --format=json --output=/tmp/pip-audit.json -r requirements.txt 2>/dev/null
+          set -e
+          VULN_COUNT=$(jq 'length' /tmp/pip-audit.json 2>/dev/null || echo "0")
+          echo "total=${VULN_COUNT}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # 2. CodeQL Analysis (full scan only)
+      # -----------------------------------------------------------------------
+      - name: Detect languages for CodeQL
+        id: detect-lang
+        if: inputs.scan-type == 'full'
+        run: |
+          LANGUAGES=""
+          # Detect languages present in the repository
+          if find . -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" | head -1 | grep -q .; then
+            LANGUAGES="${LANGUAGES:+${LANGUAGES},}javascript-typescript"
+          fi
+          if find . -name "*.py" | head -1 | grep -q .; then
+            LANGUAGES="${LANGUAGES:+${LANGUAGES},}python"
+          fi
+          if find . -name "*.go" | head -1 | grep -q .; then
+            LANGUAGES="${LANGUAGES:+${LANGUAGES},}go"
+          fi
+          if find . -name "*.java" -o -name "*.kt" | head -1 | grep -q .; then
+            LANGUAGES="${LANGUAGES:+${LANGUAGES},}java-kotlin"
+          fi
+          if find . -name "*.rb" | head -1 | grep -q .; then
+            LANGUAGES="${LANGUAGES:+${LANGUAGES},}ruby"
+          fi
+          echo "languages=${LANGUAGES:-none}" >> "$GITHUB_OUTPUT"
+          echo "Detected languages for CodeQL: ${LANGUAGES:-none}"
+
+      - name: Initialize CodeQL
+        if: inputs.scan-type == 'full' && steps.detect-lang.outputs.languages != 'none'
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ steps.detect-lang.outputs.languages }}
+
+      - name: Perform CodeQL Analysis
+        id: codeql
+        if: inputs.scan-type == 'full' && steps.detect-lang.outputs.languages != 'none'
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:${{ steps.detect-lang.outputs.languages }}'
+
+      # -----------------------------------------------------------------------
+      # 3. Container Image Scan (full scan only, if Dockerfile exists)
+      # -----------------------------------------------------------------------
+      - name: Build container image for scanning
+        id: container-build
+        if: inputs.scan-type == 'full' && hashFiles('Dockerfile') != ''
+        run: |
+          docker build -t scan-target:latest .
+          echo "image-built=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run Trivy container scan
+        id: trivy
+        if: inputs.scan-type == 'full' && steps.container-build.outputs.image-built == 'true'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: 'scan-target:latest'
+          format: 'sarif'
+          output: '/tmp/trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+        continue-on-error: true
+
+      - name: Upload Trivy SARIF to GitHub Security
+        if: inputs.scan-type == 'full' && steps.container-build.outputs.image-built == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: /tmp/trivy-results.sarif
+          category: 'container-scan'
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # 4. Filesystem vulnerability scan with Trivy (full scan)
+      # -----------------------------------------------------------------------
+      - name: Run Trivy filesystem scan
+        id: trivy-fs
+        if: inputs.scan-type == 'full'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: '/tmp/trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+        continue-on-error: true
+
+      - name: Upload filesystem SARIF to GitHub Security
+        if: inputs.scan-type == 'full'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: /tmp/trivy-fs-results.sarif
+          category: 'filesystem-scan'
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # 5. Summary and severity gate
+      # -----------------------------------------------------------------------
+      - name: Aggregate results and evaluate severity gate
+        id: summary
+        run: |
+          NPM_TOTAL="${{ steps.npm-audit.outputs.total || '0' }}"
+          PIP_TOTAL="${{ steps.pip-audit.outputs.total || '0' }}"
+          TOTAL=$((NPM_TOTAL + PIP_TOTAL))
+
+          echo "total-vulnerabilities=${TOTAL}" >> "$GITHUB_OUTPUT"
+          echo "report-url=${{ github.server_url }}/${{ github.repository }}/security" >> "$GITHUB_OUTPUT"
+
+          echo "### Security Scan Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Scanner | Vulnerabilities |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| npm audit | ${NPM_TOTAL} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| pip audit | ${PIP_TOTAL} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Total** | **${TOTAL}** |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Severity gate: **${{ inputs.fail-on-severity }}**" >> "$GITHUB_STEP_SUMMARY"
+
+          # Evaluate severity gate
+          FAIL=false
+          case "${{ inputs.fail-on-severity }}" in
+            critical)
+              [ "${{ steps.npm-audit.outputs.critical || '0' }}" -gt 0 ] && FAIL=true
+              ;;
+            high)
+              [ "${{ steps.npm-audit.outputs.critical || '0' }}" -gt 0 ] && FAIL=true
+              [ "${{ steps.npm-audit.outputs.high || '0' }}" -gt 0 ] && FAIL=true
+              ;;
+            medium)
+              [ "${{ steps.npm-audit.outputs.critical || '0' }}" -gt 0 ] && FAIL=true
+              [ "${{ steps.npm-audit.outputs.high || '0' }}" -gt 0 ] && FAIL=true
+              [ "${{ steps.npm-audit.outputs.medium || '0' }}" -gt 0 ] && FAIL=true
+              ;;
+            low)
+              [ "${TOTAL}" -gt 0 ] && FAIL=true
+              ;;
+          esac
+
+          if [ "${FAIL}" = "true" ]; then
+            echo "::error::Security scan found vulnerabilities at or above severity threshold: ${{ inputs.fail-on-severity }}"
+            exit 1
+          else
+            echo "No vulnerabilities at or above severity threshold."
+          fi

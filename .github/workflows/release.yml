@@ -1,0 +1,222 @@
+# =============================================================================
+# Reusable Release Workflow
+# =============================================================================
+# Automates versioning, changelog generation, Git tagging, GitHub Release
+# creation, and optional npm publishing.
+#
+# USAGE:
+#   jobs:
+#     release:
+#       uses: <owner>/<repo>/.github/workflows/release.yml@main
+#       with:
+#         version-bump: 'minor'
+#         prerelease: false
+#         generate-changelog: true
+#       secrets:
+#         npm-token: ${{ secrets.NPM_TOKEN }}
+#       permissions:
+#         contents: write
+# =============================================================================
+
+name: Reusable Release
+
+on:
+  workflow_call:
+    inputs:
+      version-bump:
+        description: 'Semantic version bump type: patch, minor, or major'
+        type: string
+        required: true
+        # Callers should pass one of: patch | minor | major
+      prerelease:
+        description: 'Mark this release as a prerelease'
+        type: boolean
+        required: false
+        default: false
+      generate-changelog:
+        description: 'Auto-generate changelog from conventional commits'
+        type: boolean
+        required: false
+        default: true
+    outputs:
+      new-version:
+        description: 'The new version string (e.g. 1.2.3 or 1.2.3-rc.1)'
+        value: ${{ jobs.release.outputs.new-version }}
+      release-url:
+        description: 'URL of the created GitHub Release'
+        value: ${{ jobs.release.outputs.release-url }}
+      changelog:
+        description: 'Generated changelog content'
+        value: ${{ jobs.release.outputs.changelog }}
+    secrets:
+      npm-token:
+        description: 'NPM token for publishing packages (omit to skip npm publish)'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      new-version: ${{ steps.version.outputs.new-version }}
+      release-url: ${{ steps.gh-release.outputs.url }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Determine new version
+        id: version
+        run: |
+          # Get current version from package.json (if it exists) or latest git tag
+          if [ -f package.json ]; then
+            CURRENT=$(node -e "console.log(require('./package.json').version || '0.0.0')")
+          else
+            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+            CURRENT="${LATEST_TAG#v}"
+          fi
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${CURRENT%-*}"
+          MAJOR=${MAJOR:-0}
+          MINOR=${MINOR:-0}
+          PATCH=${PATCH:-0}
+
+          case "${{ inputs.version-bump }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+            *)
+              echo "::error::Invalid version-bump: ${{ inputs.version-bump }}. Must be patch, minor, or major."
+              exit 1
+              ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            # Use short SHA as prerelease identifier
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            NEW_VERSION="${NEW_VERSION}-rc.${SHORT_SHA}"
+          fi
+
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "new-version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Previous version: ${CURRENT}"
+          echo "New version:      ${NEW_VERSION}"
+
+      - name: Generate changelog
+        id: changelog
+        if: inputs.generate-changelog
+        run: |
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          RANGE="${PREVIOUS_TAG:+${PREVIOUS_TAG}..HEAD}"
+          RANGE="${RANGE:-HEAD}"
+
+          echo "Generating changelog for range: ${RANGE}"
+
+          {
+            echo "changelog<<CHANGELOG_EOF"
+
+            echo "## What's Changed in v${{ steps.version.outputs.new-version }}"
+            echo ""
+
+            # Group commits by conventional commit type
+            for TYPE_LABEL in "feat:Features" "fix:Bug Fixes" "perf:Performance" "refactor:Refactoring" "docs:Documentation" "test:Tests" "chore:Maintenance"; do
+              TYPE="${TYPE_LABEL%%:*}"
+              LABEL="${TYPE_LABEL#*:}"
+              COMMITS=$(git log ${RANGE} --pretty=format:"- %s (%h)" --grep="^${TYPE}" 2>/dev/null || true)
+              if [ -n "${COMMITS}" ]; then
+                echo "### ${LABEL}"
+                echo "${COMMITS}"
+                echo ""
+              fi
+            done
+
+            # Uncategorized commits
+            UNCATEGORIZED=$(git log ${RANGE} --pretty=format:"- %s (%h)" \
+              --invert-grep --grep="^feat" --grep="^fix" --grep="^perf" \
+              --grep="^refactor" --grep="^docs" --grep="^test" --grep="^chore" \
+              2>/dev/null || true)
+            if [ -n "${UNCATEGORIZED}" ]; then
+              echo "### Other Changes"
+              echo "${UNCATEGORIZED}"
+              echo ""
+            fi
+
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update package.json version
+        if: hashFiles('package.json') != ''
+        run: |
+          npm version "${{ steps.version.outputs.new-version }}" --no-git-tag-version --allow-same-version
+
+      - name: Create and push git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Commit version bump if package.json was updated
+          if git diff --quiet; then
+            echo "No file changes to commit."
+          else
+            git add -A
+            git commit -m "chore(release): v${{ steps.version.outputs.new-version }}"
+          fi
+
+          git tag -a "v${{ steps.version.outputs.new-version }}" \
+            -m "Release v${{ steps.version.outputs.new-version }}"
+          git push origin HEAD --follow-tags
+
+      - name: Create GitHub Release
+        id: gh-release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const changelog = `${{ steps.changelog.outputs.changelog || 'No changelog generated.' }}`;
+            const release = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: 'v${{ steps.version.outputs.new-version }}',
+              name: 'v${{ steps.version.outputs.new-version }}',
+              body: changelog,
+              prerelease: ${{ inputs.prerelease }},
+              generate_release_notes: !${{ inputs.generate-changelog }},
+            });
+            core.setOutput('url', release.data.html_url);
+            core.setOutput('id', release.data.id);
+            console.log(`Release created: ${release.data.html_url}`);
+
+      - name: Publish to npm
+        if: secrets.npm-token != '' && hashFiles('package.json') != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.npm-token }}
+        run: |
+          TAG_ARG=""
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            TAG_ARG="--tag next"
+          fi
+          npm publish ${TAG_ARG} --access public || echo "::warning::npm publish failed or was skipped"
+
+      - name: Release summary
+        run: |
+          echo "### Release v${{ steps.version.outputs.new-version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Version** | v${{ steps.version.outputs.new-version }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Prerelease** | ${{ inputs.prerelease }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Release URL** | ${{ steps.gh-release.outputs.url }} |" >> "$GITHUB_STEP_SUMMARY"

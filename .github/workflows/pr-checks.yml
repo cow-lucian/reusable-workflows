@@ -1,0 +1,284 @@
+# =============================================================================
+# Reusable PR Validation Workflow
+# =============================================================================
+# Validates pull requests: label requirements, conventional commit messages,
+# PR size limits, and automatic reviewer assignment.
+#
+# USAGE:
+#   jobs:
+#     pr-validation:
+#       uses: <owner>/<repo>/.github/workflows/pr-checks.yml@main
+#       with:
+#         require-labels: true
+#         required-label-pattern: '^(bug|feature|docs|chore|refactor)'
+#         check-conventional-commits: true
+#         max-file-changes: 50
+#       permissions:
+#         pull-requests: write
+#         contents: read
+# =============================================================================
+
+name: Reusable PR Checks
+
+on:
+  workflow_call:
+    inputs:
+      require-labels:
+        description: 'Require at least one label matching the pattern'
+        type: boolean
+        required: false
+        default: true
+      required-label-pattern:
+        description: 'Regex pattern that at least one PR label must match'
+        type: string
+        required: false
+        default: ''
+      check-conventional-commits:
+        description: 'Validate that PR title follows Conventional Commits format'
+        type: boolean
+        required: false
+        default: true
+      max-file-changes:
+        description: 'Maximum number of changed files before a warning is issued'
+        type: number
+        required: false
+        default: 50
+    outputs:
+      validation-result:
+        description: 'Overall validation result: pass or fail'
+        value: ${{ jobs.pr-checks.outputs.result }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  pr-checks:
+    name: PR Validation
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.final.outputs.result }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # 1. Label Check
+      # -----------------------------------------------------------------------
+      - name: Validate PR labels
+        id: label-check
+        if: inputs.require-labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+
+            const labels = pr.data.labels.map(l => l.name);
+            console.log(`PR labels: ${labels.join(', ') || '(none)'}`);
+
+            if (labels.length === 0) {
+              core.setFailed('PR has no labels. Please add at least one label.');
+              return;
+            }
+
+            const pattern = '${{ inputs.required-label-pattern }}';
+            if (pattern) {
+              const regex = new RegExp(pattern);
+              const match = labels.some(l => regex.test(l));
+              if (!match) {
+                core.setFailed(
+                  `No label matches required pattern: ${pattern}\n` +
+                  `Current labels: ${labels.join(', ')}`
+                );
+              } else {
+                console.log(`Label check passed. Matching label found.`);
+              }
+            }
+
+      # -----------------------------------------------------------------------
+      # 2. Conventional Commits Check
+      # -----------------------------------------------------------------------
+      - name: Validate PR title (Conventional Commits)
+        id: commit-check
+        if: inputs.check-conventional-commits
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+
+            const title = pr.data.title;
+            console.log(`PR title: "${title}"`);
+
+            // Conventional Commits pattern:
+            // type(optional-scope): description
+            // type may also have ! before : for breaking changes
+            const pattern = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?:\s.+/;
+
+            if (!pattern.test(title)) {
+              core.setFailed(
+                `PR title does not follow Conventional Commits format.\n` +
+                `Expected: type(scope): description\n` +
+                `Examples: "feat(auth): add OAuth2 support", "fix: resolve null pointer"\n` +
+                `Valid types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert\n` +
+                `Got: "${title}"`
+              );
+            } else {
+              console.log('PR title follows Conventional Commits format.');
+            }
+
+      # -----------------------------------------------------------------------
+      # 3. PR Size Check
+      # -----------------------------------------------------------------------
+      - name: Check PR size
+        id: size-check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+
+            const fileCount = files.length;
+            const additions = files.reduce((sum, f) => sum + f.additions, 0);
+            const deletions = files.reduce((sum, f) => sum + f.deletions, 0);
+            const maxFiles = ${{ inputs.max-file-changes }};
+
+            console.log(`Files changed: ${fileCount} (max: ${maxFiles})`);
+            console.log(`Lines added: ${additions}, deleted: ${deletions}`);
+
+            // Categorize PR size
+            let sizeLabel = 'size/S';
+            if (additions + deletions > 1000 || fileCount > 50) {
+              sizeLabel = 'size/XL';
+            } else if (additions + deletions > 500 || fileCount > 25) {
+              sizeLabel = 'size/L';
+            } else if (additions + deletions > 100 || fileCount > 10) {
+              sizeLabel = 'size/M';
+            }
+            core.setOutput('size-label', sizeLabel);
+
+            if (fileCount > maxFiles) {
+              core.warning(
+                `PR changes ${fileCount} files, which exceeds the limit of ${maxFiles}. ` +
+                `Consider splitting this PR into smaller, focused changes.`
+              );
+            }
+
+            // Add size label to PR
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: [sizeLabel],
+              });
+            } catch (e) {
+              console.log(`Could not add size label: ${e.message}`);
+            }
+
+      # -----------------------------------------------------------------------
+      # 4. Auto-assign Reviewers
+      # -----------------------------------------------------------------------
+      - name: Auto-assign reviewers
+        id: assign-reviewers
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+
+            // Skip if reviewers are already assigned
+            if (pr.data.requested_reviewers.length > 0 || pr.data.requested_teams.length > 0) {
+              console.log('Reviewers already assigned. Skipping auto-assignment.');
+              return;
+            }
+
+            // Attempt to load CODEOWNERS or .github/CODEOWNERS for reviewer hints
+            // Fallback: assign based on recent contributors to changed files
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+
+            const author = pr.data.user.login;
+            const potentialReviewers = new Set();
+
+            // Get recent committers for changed files (up to 5 files sampled)
+            for (const file of files.slice(0, 5)) {
+              try {
+                const commits = await github.rest.repos.listCommits({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  path: file.filename,
+                  per_page: 5,
+                });
+                for (const commit of commits.data) {
+                  const login = commit.author?.login;
+                  if (login && login !== author && login !== 'github-actions[bot]') {
+                    potentialReviewers.add(login);
+                  }
+                }
+              } catch (e) {
+                // File may be new; skip
+              }
+            }
+
+            const reviewers = [...potentialReviewers].slice(0, 2);
+            if (reviewers.length > 0) {
+              try {
+                await github.rest.pulls.requestReviewers({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.issue.number,
+                  reviewers,
+                });
+                console.log(`Assigned reviewers: ${reviewers.join(', ')}`);
+              } catch (e) {
+                console.log(`Could not assign reviewers: ${e.message}`);
+              }
+            } else {
+              console.log('No suitable reviewers found for auto-assignment.');
+            }
+
+      # -----------------------------------------------------------------------
+      # 5. Summary
+      # -----------------------------------------------------------------------
+      - name: Compute final result
+        id: final
+        if: always()
+        run: |
+          LABEL_OK="${{ steps.label-check.outcome || 'success' }}"
+          COMMIT_OK="${{ steps.commit-check.outcome || 'success' }}"
+          SIZE_OK="${{ steps.size-check.outcome || 'success' }}"
+
+          if [ "${LABEL_OK}" = "success" ] && [ "${COMMIT_OK}" = "success" ] && [ "${SIZE_OK}" = "success" ]; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "### PR Validation Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Check | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Label check | \`${LABEL_OK}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Conventional commits | \`${COMMIT_OK}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| PR size check | \`${SIZE_OK}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Size label | \`${{ steps.size-check.outputs.size-label || 'N/A' }}\` |" >> "$GITHUB_STEP_SUMMARY"

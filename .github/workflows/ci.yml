@@ -1,0 +1,133 @@
+# =============================================================================
+# Reusable CI Workflow
+# =============================================================================
+# Performs continuous integration: checkout, install, lint, test, coverage.
+#
+# USAGE:
+#   jobs:
+#     ci:
+#       uses: <owner>/<repo>/.github/workflows/ci.yml@main
+#       with:
+#         node-version: '20'
+#         working-directory: './packages/api'
+#         run-lint: true
+#         run-tests: true
+#       secrets:
+#         npm-token: ${{ secrets.NPM_TOKEN }}
+# =============================================================================
+
+name: Reusable CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: 'Node.js version to use'
+        type: string
+        required: false
+        default: '20'
+      working-directory:
+        description: 'Working directory for all commands'
+        type: string
+        required: false
+        default: './'
+      run-lint:
+        description: 'Whether to run the lint step'
+        type: boolean
+        required: false
+        default: true
+      run-tests:
+        description: 'Whether to run the test step'
+        type: boolean
+        required: false
+        default: true
+    outputs:
+      test-result:
+        description: 'Result of the test run (success/failure/skipped)'
+        value: ${{ jobs.ci.outputs.test-result }}
+      coverage-percentage:
+        description: 'Code coverage percentage from the test run'
+        value: ${{ jobs.ci.outputs.coverage-percentage }}
+    secrets:
+      npm-token:
+        description: 'NPM authentication token for private packages'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI Pipeline
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      test-result: ${{ steps.test.outputs.result || 'skipped' }}
+      coverage-percentage: ${{ steps.coverage.outputs.percentage || '0' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: '${{ inputs.working-directory }}/package-lock.json'
+
+      - name: Configure NPM authentication
+        if: secrets.npm-token != ''
+        run: echo "//registry.npmjs.org/:_authToken=${{ secrets.npm-token }}" > ~/.npmrc
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts=false
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.npm-token }}
+
+      - name: Run linter
+        if: inputs.run-lint
+        id: lint
+        run: |
+          echo "::group::Lint output"
+          npm run lint --if-present 2>&1 | tee lint-output.txt
+          echo "::endgroup::"
+
+      - name: Run tests
+        if: inputs.run-tests
+        id: test
+        run: |
+          npm test --if-present -- --coverage 2>&1 | tee test-output.txt
+          echo "result=success" >> "$GITHUB_OUTPUT"
+        continue-on-error: false
+
+      - name: Extract coverage percentage
+        if: inputs.run-tests && steps.test.outcome == 'success'
+        id: coverage
+        run: |
+          # Attempt to extract coverage from common formats
+          COVERAGE="0"
+          if [ -f coverage/coverage-summary.json ]; then
+            COVERAGE=$(node -e "
+              const data = require('./coverage/coverage-summary.json');
+              console.log(data.total.lines.pct || 0);
+            " 2>/dev/null || echo "0")
+          elif [ -f test-output.txt ]; then
+            # Fallback: parse coverage from Jest/Vitest console output
+            COVERAGE=$(grep -oP 'All files[^|]*\|\s*\K[\d.]+' test-output.txt | head -1 || echo "0")
+          fi
+          echo "percentage=${COVERAGE}" >> "$GITHUB_OUTPUT"
+          echo "### Coverage: ${COVERAGE}%" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage artifact
+        if: inputs.run-tests && steps.test.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: ${{ inputs.working-directory }}/coverage/
+          retention-days: 14
+          if-no-files-found: ignore
