@@ -1,0 +1,169 @@
+# =============================================================================
+# Reusable Workflow: GitHub App Authentication
+# =============================================================================
+# SCHOLAR NOTE:
+#   This reusable workflow generates a GitHub App installation token that
+#   callers can use for operations that GITHUB_TOKEN cannot perform:
+#   - Triggering other workflows
+#   - Cross-repository operations
+#   - Pushing to protected branches
+#   - Admin-level API operations
+#
+# WHY USE A GITHUB APP OVER A PAT?
+#   1. Tokens expire in 1 hour (PATs can be long-lived)
+#   2. Permissions are scoped to installations (PATs are per-user)
+#   3. Rate limits are per-installation (PATs share user's limit)
+#   4. Better audit trail (actions attributed to app, not user)
+#   5. No user account dependency (user leaving doesn't break CI)
+#
+# SETUP PREREQUISITES:
+#   1. Create a GitHub App at Settings > Developer settings > GitHub Apps
+#   2. Configure permissions the app needs
+#   3. Install the app on target repositories
+#   4. Store APP_ID and APP_PRIVATE_KEY as secrets
+# =============================================================================
+
+name: Reusable GitHub App Auth
+
+on:
+  workflow_call:
+    inputs:
+      repositories:
+        description: >
+          Comma-separated list of repository names to scope the token to.
+          Leave empty for all repositories where the App is installed.
+        type: string
+        required: false
+        default: ''
+      permissions:
+        description: >
+          JSON object of permissions. Leave empty for all App permissions.
+          Example: '{"contents":"write","pull-requests":"write"}'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      app-id:
+        description: 'The GitHub App ID'
+        required: true
+      app-private-key:
+        description: 'The GitHub App private key (PEM format)'
+        required: true
+    outputs:
+      token:
+        description: 'GitHub App installation access token'
+        value: ${{ jobs.generate-token.outputs.token }}
+      expires-at:
+        description: 'Token expiry time (ISO 8601)'
+        value: ${{ jobs.generate-token.outputs.expires-at }}
+
+permissions:
+  contents: read
+
+jobs:
+  generate-token:
+    name: "Generate App Token"
+    runs-on: ubuntu-latest
+    outputs:
+      token: ${{ steps.token.outputs.token }}
+      expires-at: ${{ steps.token.outputs.expires-at }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Option A: Using the official actions/create-github-app-token action
+      # This is the RECOMMENDED approach for production use.
+      # -----------------------------------------------------------------------
+      - name: Generate token (recommended method)
+        id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          repositories: ${{ inputs.repositories }}
+
+      # -----------------------------------------------------------------------
+      # Validate the generated token
+      # -----------------------------------------------------------------------
+      - name: Validate token
+        run: |
+          echo "=== Token Validation ==="
+
+          # Check the token works
+          HTTP_CODE=$(curl -s -o /tmp/token-check.json -w "%{http_code}" \
+            -H "Authorization: token ${{ steps.token.outputs.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/installation/repositories?per_page=1")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            TOTAL=$(jq '.total_count' /tmp/token-check.json)
+            echo "Token is valid. Accessible repositories: ${TOTAL}"
+          else
+            echo "::warning::Token validation returned HTTP ${HTTP_CODE}"
+          fi
+
+          rm -f /tmp/token-check.json
+
+      - name: Token usage examples
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          ## GitHub App Token Generated
+
+          ### How to Use in Caller Workflow
+
+          ```yaml
+          jobs:
+            get-token:
+              uses: owner/reusable-workflows/.github/workflows/github-app-auth.yml@main
+              secrets:
+                app-id: ${{ secrets.APP_ID }}
+                app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+            use-token:
+              needs: get-token
+              runs-on: ubuntu-latest
+              steps:
+                - name: Checkout (can push to protected branches)
+                  uses: actions/checkout@v4
+                  with:
+                    token: ${{ needs.get-token.outputs.token }}
+
+                - name: Create PR (triggers other workflows)
+                  run: |
+                    gh pr create --title "Automated PR" --body "Created by GitHub App"
+                  env:
+                    GH_TOKEN: ${{ needs.get-token.outputs.token }}
+
+                - name: Cross-repo operation
+                  run: |
+                    gh api repos/org/other-repo/dispatches \
+                      -f event_type=deploy
+                  env:
+                    GH_TOKEN: ${{ needs.get-token.outputs.token }}
+          ```
+
+          ### Common Use Cases for GitHub App Tokens
+
+          | Use Case | Why GITHUB_TOKEN Fails |
+          |----------|----------------------|
+          | Trigger other workflows | GITHUB_TOKEN events don't trigger workflows |
+          | Push to protected branches | GITHUB_TOKEN is not a bypass actor |
+          | Cross-repo operations | GITHUB_TOKEN is scoped to current repo |
+          | Create deployments | Need deployments write in some configs |
+          | Admin API operations | GITHUB_TOKEN max is write, not admin |
+
+          ### GitHub App Permissions Reference
+
+          When creating your GitHub App, configure these permissions:
+
+          | Permission | Level | Use Case |
+          |------------|-------|----------|
+          | Contents | Read & Write | Push code, create branches |
+          | Pull requests | Read & Write | Create/merge PRs |
+          | Issues | Read & Write | Create/manage issues |
+          | Workflows | Read & Write | Update workflow files |
+          | Deployments | Read & Write | Create deployments |
+          | Actions | Read & Write | Manage workflow runs |
+          | Administration | Read | Read repo settings |
+          | Checks | Read & Write | Create check runs |
+          | Metadata | Read | Always required (auto-granted) |
+          EOF

@@ -18,6 +18,8 @@ All workflows live in `.github/workflows/` and are invoked via `workflow_call`.
 | [Security Scan](#security-scan) | `security-scan.yml` | Dependency audit, CodeQL, container scanning, SARIF upload |
 | [Notify](#notify) | `notify.yml` | Notifications to Slack, Teams, and Discord |
 | [PR Checks](#pr-checks) | `pr-checks.yml` | PR validation: labels, conventional commits, size, reviewers |
+| [Secrets Inheritance](#secrets-inheritance) | `secrets-inheritance.yml` | **Secrets flow patterns: explicit passing, inherit, environment** |
+| [GitHub App Auth](#github-app-auth) | `github-app-auth.yml` | **GitHub App token generation for elevated permissions** |
 
 ---
 
@@ -457,6 +459,107 @@ jobs:
       channels: 'slack'
     secrets:
       slack-webhook: ${{ secrets.SLACK_WEBHOOK }}
+```
+
+---
+
+## Secrets Inheritance
+
+**File:** `.github/workflows/secrets-inheritance.yml`
+
+Demonstrates ALL patterns for passing secrets between caller and reusable workflows. Includes secret availability auditing, environment-protected secrets, and comprehensive documentation.
+
+### Inputs
+
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `environment` | No | `''` | Target environment (activates env protection rules) |
+| `log-secret-availability` | No | `true` | Log which secrets are available (not values) |
+
+### Secrets
+
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `deploy-token` | Yes | Deployment authentication token |
+| `api-key` | No | API key for target service |
+| `database-url` | No | Database connection string |
+| `notification-webhook` | No | Slack/Teams webhook URL |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `secrets-report` | JSON report of which secrets were available |
+
+### Usage
+
+```yaml
+# Pattern 1: Explicit secret passing
+jobs:
+  deploy:
+    uses: owner/reusable-workflows/.github/workflows/secrets-inheritance.yml@main
+    with:
+      environment: production
+    secrets:
+      deploy-token: ${{ secrets.DEPLOY_TOKEN }}
+      api-key: ${{ secrets.API_KEY }}
+
+# Pattern 2: Inherit ALL secrets
+jobs:
+  deploy:
+    uses: owner/reusable-workflows/.github/workflows/secrets-inheritance.yml@main
+    with:
+      environment: staging
+    secrets: inherit
+```
+
+---
+
+## GitHub App Auth
+
+**File:** `.github/workflows/github-app-auth.yml`
+
+Generates a GitHub App installation access token for operations that GITHUB_TOKEN cannot perform: triggering workflows, cross-repo operations, pushing to protected branches.
+
+### Inputs
+
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `repositories` | No | All installed | Comma-separated repo names to scope token |
+| `permissions` | No | All granted | JSON permissions object |
+
+### Secrets
+
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `app-id` | Yes | GitHub App ID |
+| `app-private-key` | Yes | GitHub App private key (PEM) |
+
+### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `token` | Installation access token (1hr lifetime) |
+| `expires-at` | Token expiry timestamp |
+
+### Usage
+
+```yaml
+jobs:
+  get-token:
+    uses: owner/reusable-workflows/.github/workflows/github-app-auth.yml@main
+    secrets:
+      app-id: ${{ secrets.APP_ID }}
+      app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+  deploy:
+    needs: get-token
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ needs.get-token.outputs.token }}
+      - run: git push  # Can push to protected branches and trigger workflows
 ```
 
 ---
